@@ -1,0 +1,10 @@
+抓包分析命令
+tcpdump -A -nn -s 0 'tcp  port 9200 ' -i eth1
+
+-s  指定数据包大小，缺省是65535
+
+-A ：封包的內容以 ASCII 顯示，通常用來捉取 WWW 的網頁封包資料
+
+防止包截断：tcpdump -s0
+
+-nn 以IP方式显示host
