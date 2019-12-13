@@ -35,7 +35,7 @@ ip_vs
 ip_vs_rr
 ip_vs_wrr
 ip_vs_sh
-nf_conntrack_ipv4
+nf_conntrack
 
 在所有的Kubernetes节点上执行以下脚本:
 cat > /etc/sysconfig/modules/ipvs.modules <<EOF
