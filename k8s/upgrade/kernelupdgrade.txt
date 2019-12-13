@@ -1,4 +1,4 @@
-升级内核的正确方法:  Centos7
+升级内核的正确方法:  Centos7 来源https://www.centos.bz/2017/08/upgrade-centos-7-6-kernel-to-4-12-4/
 一、查看那系统内核版本
 uname -r
 3.10.0-862.el7.x86_64
