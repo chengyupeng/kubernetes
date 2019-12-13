@@ -1,2 +1,7 @@
-k8s访问dashboard 
+k8s访问dashboard
+访问
 https://www.jianshu.com/p/4e65e28fa8af
+
+
+搭建
+https://www.jianshu.com/p/402c24525628
