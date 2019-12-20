@@ -1,0 +1,227 @@
+Docker Flannel+Etcd分布式网络部署
+一 环境准备
+1.1 Flannel概述
+Flannel是一种基于overlay网络的跨主机容器网络解决方案，即将TCP数据包封装在另一种网络包里面进行路由转发和通信，Flannel是CoreOS开发,专门用于docker多机互联的一个工具,让集群中的不同节点主机创建的容器都具有全集群唯一的虚拟ip地址
+
+1.2 原理说明
+Flannel为每个host分配一个subnet，容器从subnet中分配IP，这些IP可以在host间路由，容器间无需使用nat和端口映射即可实现跨主机通信。每个subnet都是从一个更大的IP池中划分的，flannel会在每个主机上运flanneld的agent，负责从池子中分配subnet。
+Flannel使用etcd存放网络配置、已分配的subnet、host的IP等信息，Flannel数据包在主机间转发是由backend实现的，目前已经支持UDP、VxLAN、host-gw、AWS VPC和GCE路由等多种backend。
+
+1.3 基础环境
+ntp配置：略 #建议配置ntp服务，保证时间一致性
+etcd版本：v3.3.9
+docker版本：19.03.5
+
+防火墙及SELinux：关闭防火墙和SELinux
+docker01 172.16.18.131  19.03.5
+docker02 172.16.18.146  19.03.5
+
+docker01中容器网段 10.1.15.2/24
+
+docker02中容器网段 10.1.20.2/24
+
+部署架构图
+
+数据转发流程
+1.容器直接使用目标容器的IP进行访问，默认通过容器内部的eth0发送出去
+2.报文通过veth pair被发送到vethXXX
+3.vethXXX直接连接到虚拟交换机的docker0,报文通过虚拟网桥bridge docker0发送出去
+4.查找路由表，外部容器的IP的报文都会转发到flannel0虚拟网卡，这是一个P2P的虚拟网卡，然后就被转发到监听在另外一端的flanneld
+5.flanneld通过etcd维护了各个节点的路由表,把原来的报文UDP封装一层,通过配置的iface发送出去
+6.报文通过主机之间的网络找到目标主机
+7.报文继续往上到传输层,交给监听在8285端口的flanneld程序处理
+8.数据被解包，然后发送给flannel0虚拟网卡
+9.查找路由表,发现对应容器的报文要交给docker0
+10.docker0找到要连接自己的容器，然后把报文发出去
+
+1.5 相关顺序
+部署顺序建议为：etcd---->flannel---->docker，也可独立分开部署，可能需要重启相关服务，才能使flannel从etcd获取网络信息，docker才能从flannel获取相关IP。
+启动顺序必须为：etcd---->flannel---->docker，必须保证etcd启动正常，才能使flannel获取正确地址段，docker容器才能从flannel获取唯一地址。
+二 etcd节点部署
+2.1 单节点部署etcd
+root@etcd1:~# mkdir -p /var/log/etcd/			#建议创建etcd日志保存目录
+root@etcd1:~# mkdir -p /data/etcd			        #建议创建单独的etcd数据目录
+wget https://github.com/etcd-io/etcd/releases/download/v3.3.9/etcd-v3.3.9-linux-amd64.tar.gz
+
+root@etcd1:~# ETCD_VER=v3.3.10
+root@etcd1:~# GITHUB_URL=https://github.com/etcd-io/etcd/releases/download
+root@etcd1:~# DOWNLOAD_URL=${GITHUB_URL}
+root@etcd1:~# curl -L ${DOWNLOAD_URL}/${ETCD_VER}/etcd-${ETCD_VER}-linux-amd64.tar.gz -o /tmp/etcd-${ETCD_VER}-linux-amd64.tar.gz
+root@etcd1:~# tar xzvf /tmp/etcd-${ETCD_VER}-linux-amd64.tar.gz -C /tmp/etcd-download-test --strip-components=1
+root@etcd1:~# rm -f /tmp/etcd-${ETCD_VER}-linux-amd64.tar.gz
+root@etcd1:~# cp /tmp/etcd-download-test/etcd* /usr/local/bin/
+root@etcd1:~# etcd --version
+
+vim /etc/systemd/system/etcd.service
+[Unit]
+Description=etcd
+Documentation=https://github.com/coreos/etcd
+Conflicts=etcd.service
+
+[Service]
+Type=notify
+Restart=always
+RestartSec=5s
+LimitNOFILE=40000
+TimeoutStartSec=0
+
+ExecStart=/usr/local/bin/etcd --name etcd1 --data-dir /data/etcd \
+--listen-client-urls http://172.16.18.62:2379,http://127.0.0.1:2379 \
+--advertise-client-urls http://172.16.18.62:2379
+
+[Install]
+WantedBy=multi-user.target
+
+systemctl daemon-reload
+systemctl enable etcd
+
+systemctl restart etcd
+提示：使用yum安装etcd则etcd.service会自动创建，且引用/etc/etcd/etcd.conf中的配置文件参数启动。
+2.4 Etcd中添加相应网段
+按照1.3基础环境规划网段，添加etcd键值。
+etcdctl --endpoints http://172.16.18.62:2379 set /flannel/network/config '{"Network": "10.1.0.0/16", "SubnetLen": 24, "SubnetMin": "10.1.15.0","SubnetMax": "10.1.20.0", "Backend": {"Type": "vxlan"}}'
+[root@harbor etcd]# etcdctl  --endpoints http://172.16.18.62:2379 get /flannel/network/config
+{"Network": "10.1.0.0/16", "SubnetLen": 24, "SubnetMin": "10.1.15.0","SubnetMax": "10.1.20.0", "Backend": {"Type": "vxlan"}}
+
+下载flanel  flanel节点
+wget https://github.com/coreos/flannel/releases/download/v0.10.0/flannel-v0.10.0-linux-amd64.tar.gz
+cp flanneld /usr/local/bin/
+cp mk-docker-opts.sh /usr/local/bin/
+
+vim /etc/systemd/system/flanneld.service  131  146 
+[Unit]
+Description=Flanneld overlay address etcd agent
+Documentation=https://github.com/coreos/flannel
+After=network.target
+After=network-online.target
+Wants=network-online.target
+After=etcd.service                                              #指定flannel在etcd之后、docker之前启动
+Before=docker.service
+
+[Service]
+User=root
+Type=notify
+LimitNOFILE=65536
+EnvironmentFile=/etc/flannel/flanneld.conf                      #指定flannel配置文件
+ExecStart=/usr/local/bin/flanneld \
+-etcd-endpoints=${FLANNEL_ETCD_ENDPOINTS} \
+-etcd-prefix=${FLANNEL_ETCD_PREFIX} $FLANNEL_OPTIONS
+#使用引用flannel配置文件中的参数形式
+ExecStartPost=/usr/local/bin/mk-docker-opts.sh -k DOCKER_NETWORK_OPTIONS -d /run/flannel/docker                                                                         #见解读部分
+Restart=on-failure
+
+
+[Install]
+WantedBy=multi-user.target
+mkdir /etc/flannel
+
+
+vim /etc/flannel/flanneld.conf
+
+# Flanneld configuration options
+# etcd url location.  Point this to the server where etcd runs
+FLANNEL_ETCD_ENDPOINTS="http://172.16.18.62:2379"           #指定etcd服务器的监听地址
+
+# etcd config key.  This is the configuration key that flannel queries
+# For address range assignment
+FLANNEL_ETCD_PREFIX="/flannel/network"                  #指定etcd网络参数所存储键值的key
+
+# Any additional options that you want to pass
+FLANNEL_OPTIONS="-iface=eno3"                            #指定用于主机间通信的接口，参数值也可为IP地址
+/etc/sysconfig/flanneld：配置相关flannel启动参数，用于flannel从etcd获取唯一地址段；
+mk-docker-opts.sh：mk-docker-opts.sh运行后会讲flannel获取的网络参数写入/run/flannel/subnet.env文件；
+-k DOCKER_NETWORK_OPTIONS：-k会将默认组合键，即DOCKER_OPTS=转换为DOCKER_NETWORK_OPTIONS，主要方便于yum安装的docker直接引用（即docker.service中的Service字段ExecStart行为已经包括$DOCKER_NETWORK_OPTIONS，从而不需要再次添加
+-d /run/flannel/docker：将/run/flannel/subnet.env文件转换为docker能识别的格式后保存为/run/flannel/docker。
+
+vim /usr/lib/systemd/system/docker.service
+EnvironmentFile=/run/flannel/docker
+ExecStart=/usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock $DOCKER_NETWORK_OPTIONS
+
+systemctl daemon-reload
+ systemctl enable flanneld.service
+ 
+
+mkdir /run/flannel
+先启动flanneld  然后启动docker
+
+ cat /run/flannel/docker	
+[root@mysql flannel]#  cat /run/flannel/docker 
+DOCKER_OPT_BIP="--bip=10.1.18.1/24"
+DOCKER_OPT_IPMASQ="--ip-masq=true"
+DOCKER_OPT_MTU="--mtu=1450"
+DOCKER_NETWORK_OPTIONS=" --bip=10.1.18.1/24 --ip-masq=true --mtu=1450"
+
+ifconfig | grep -A6 docker
+ifconfig | grep -A6 flannel
+
+七 测试确认
+7.1 创建测试容器
+docker run -id --name Container01 busybox
+[root@gfs opt]# docker ps
+CONTAINER ID        IMAGE                             COMMAND                  CREATED             STATUS                   PORTS                    NAMES
+3f1c1026793b        busybox                           "sh"                     44 seconds ago      Up 43 seconds                                     Container01
+4b4fc98c2012        vmware/harbor-db:v1.5.2           "/usr/local/bin/dock…"   3 weeks ago         Up 4 minutes (healthy)   0.0.0.0:3306->3306/tcp   mysql-server
+042ad14b9b1d        vmware/postgresql-photon:v1.5.2   "/entrypoint.sh post…"   3 weeks ago         Up 4 minutes (healthy)   0.0.0.0:5432->5432/tcp   clair-db
+6a08142ca402        vmware/redis-photon:v1.5.2        "docker-entrypoint.s…"   3 weeks ago         Up 4 minutes             0.0.0.0:6379->6379/tcp   redis-server
+[root@gfs opt]# docker exec -it 3f1c1026793b bash
+OCI runtime exec failed: exec failed: container_linux.go:346: starting container process caused "exec: \"bash\": executable file not found in $PATH": unknown
+[root@gfs opt]# docker exec -it 3f1c1026793b sh
+/ # ip a
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue qlen 1000
+    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+    inet 127.0.0.1/8 scope host lo
+       valid_lft forever preferred_lft forever
+26: eth0@if27: <BROADCAST,MULTICAST,UP,LOWER_UP,M-DOWN> mtu 1450 qdisc noqueue 
+    link/ether 02:42:0a:01:13:02 brd ff:ff:ff:ff:ff:ff
+    inet 10.1.19.2/24 brd 10.1.19.255 scope global eth0
+       valid_lft forever preferred_lft forever
+/ # ping 10.1.19.2
+
+root@mysql flannel]# docker ps
+CONTAINER ID        IMAGE                                  COMMAND                  CREATED             STATUS                            PORTS                     NAMES
+4d16973cd2bd        busybox                                "sh"                     51 seconds ago      Up 50 seconds                                               Container01
+fd55fb4d1046        vmware/harbor-jobservice:v1.5.2        "/harbor/start.sh"       2 weeks ago         Up 22 seconds                                               harbor-jobservice
+387ef81302e6        vmware/harbor-ui:v1.5.2                "/harbor/start.sh"       2 weeks ago         Up 5 seconds (health: starting)                             harbor-ui
+6f7fa39ad83b        vmware/registry-photon:v2.6.2-v1.5.2   "/entrypoint.sh serv…"   2 weeks ago         Up 4 minutes (healthy)            5000/tcp                  registry
+77ec4e4dc634        vmware/harbor-log:v1.5.2               "/bin/sh -c /usr/loc…"   2 weeks ago         Up 4 minutes (healthy)            0.0.0.0:1514->10514/tcp   harbor-log
+[root@mysql flannel]# docker exec -it 4d16973cd2bd sh
+/ # ip a
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue qlen 1000
+    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+    inet 127.0.0.1/8 scope host lo
+       valid_lft forever preferred_lft forever
+9259: eth0@if9260: <BROADCAST,MULTICAST,UP,LOWER_UP,M-DOWN> mtu 1450 qdisc noqueue 
+    link/ether 02:42:0a:01:12:02 brd ff:ff:ff:ff:ff:ff
+    inet 10.1.18.2/24 brd 10.1.18.255 scope global eth0
+       valid_lft forever preferred_lft forever
+/ # ping 10.1.19.2
+PING 10.1.19.2 (10.1.19.2): 56 data bytes
+64 bytes from 10.1.19.2: seq=0 ttl=62 time=0.674 ms
+64 bytes from 10.1.19.2: seq=1 ttl=62 time=0.676 ms
+64 bytes from 10.1.19.2: seq=2 ttl=62 time=0.688 ms
+64 bytes from 10.1.19.2: seq=3 ttl=62 time=0.617 ms
+64 bytes from 10.1.19.2: seq=4 ttl=62 time=0.608 ms
+64 bytes from 10.1.19.2: seq=5 ttl=62 time=0.586 ms
+64 bytes from 10.1.19.2: seq=6 ttl=62 time=0.572 ms
+64 bytes from 10.1.19.2: seq=7 ttl=62 time=0.685 ms
+64 bytes from 10.1.19.2: seq=8 ttl=62 time=0.567 ms
+64 bytes from 10.1.19.2: seq=9 ttl=62 time=0.653 ms
+64 bytes from 10.1.19.2: seq=10 ttl=62 time=0.702 ms
+64 bytes from 10.1.19.2: seq=11 ttl=62 time=0.643 ms
+64 bytes from 10.1.19.2: seq=12 ttl=62 time=0.536 ms
+64 bytes from 10.1.19.2: seq=13 ttl=62 time=0.633 ms
+64 bytes from 10.1.19.2: seq=14 ttl=62 time=0.609 ms
+64 bytes from 10.1.19.2: seq=15 ttl=62 time=0.709 ms
+64 bytes from 10.1.19.2: seq=16 ttl=62 time=0.644 ms
+64 bytes from 10.1.19.2: seq=17 ttl=62 time=0.642 ms
+64 bytes from 10.1.19.2: seq=18 ttl=62 time=0.644 ms
+64 bytes from 10.1.19.2: seq=19 ttl=62 time=0.717 ms
+64 bytes from 10.1.19.2: seq=20 ttl=62 time=0.633 ms
+64 bytes from 10.1.19.2: seq=21 ttl=62 time=0.651 ms
+64 bytes from 10.1.19.2: seq=22 ttl=62 time=0.648 ms
+^C
+--- 10.1.19.2 ping statistics ---
+23 packets transmitted, 23 packets received, 0% packet loss
+round-trip min/avg/max = 0.536/0.640/0.717 ms
+/ # exit
+
