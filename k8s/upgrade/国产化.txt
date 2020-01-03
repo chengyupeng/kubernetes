@@ -1,1 +1,2 @@
 http://debian.osuosl.org/debian/pool/main/d/dumb-init/
+https://github.com/Yelp/dumb-init/issues/138
