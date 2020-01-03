@@ -1,3 +1,4 @@
 http://debian.osuosl.org/debian/pool/main/d/dumb-init/
 https://github.com/Yelp/dumb-init/issues/138
 https://packages.debian.org/stretch/arm64/dumb-init/download  dumb-init下载
+http://debian.osuosl.org/debian/pool/main/g/glusterfs/  gfs下载
