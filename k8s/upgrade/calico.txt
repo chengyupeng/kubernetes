@@ -58,6 +58,8 @@ CALICO_LIBNETWORK_ENABLED=true
 CALICO_NETWORKING_BACKEND=bird
 
 2、三台主机分别添加calico-node sysinit配置文件
+ docker pull calico/node:v2.6.1
+
 [root@node1 calico]# cat /etc/systemd/system/calico-node.service 
 [Unit]
 Description=calico-node
