@@ -1,0 +1,192 @@
+
+ndpointA发出报文  --> nodeA默认路由到TOR交换机A --> TOR交换机A默认路由到核心交换机 --+
+                                                                                      |
+                                                                                      v
+EndpointB收到了报文 <--  nodeB收到了报文 <-- TOR交换机B收到了报文 <-- 核心交换机找到了下一跳地址nodeB
+calico系统结构
+1. Felix, the primary calico agent that runs on each machine that hosts endpoints
+2. etcd, the data store.
+3. BIRD, a BGP client that distributes routing information
+4. BGP Route Reflector (BIRD), an optional BGP route reflector for higher scale.
+5. The Orchestrator plugin, orchestrator-specific code that tightly integrates calico into that orchestrator.
+
+Felix负责管理设置node，
+bird是一个开源的软路由，支持多种路由协议。
+calico中的概念
+calicoctl resource definitions介绍了每类资源的格式。
+
+raw.PREROUTING -> mangle.PREROUTING -> nat.PREROUTING -> mangle.INPUT -> filter.INPUT 
+raw.PREROUTING -> mangle.PREROUTING -> nat.PREROUTING -> mangle.FORWARD -> filter.FORWARD -> mangle.POSTROUTING -> nat.POSTROUTING
+流入报文来源:
+1. 以cali+命名的网卡收到的报文，这部分报文是node上的endpoint发出的
+   (k8s中，容器的内发出的所有报文都会发送到对应的cali网卡上)
+   (通过在容器内添加静态arp，将容器网关的IP映射到cali网卡的MAC上实现)
+2. 其他网卡接收的报文，这部分报文是其它node发送或者在node本地发出的
+流入的报文去向：
+1. 访问本node的host endpoint，通过INPUT过程处理
+2. 访问本node的workload endpoint，通过INPUT过程处理
+3. 访问其它node的host endpoint，通过FORWARD过程处理。
+4. 访问其它node的workload endpoint，通过FORWARD过程处理
+
+流入的报文在路由决策之前的处理过程相同的，路由决策之后，分别进入INPUT规则链和FORWARD链。
+raw.PREROUTING -> mangle.PREROUTING -> nat.PREROUTING -> mangle.INPUT -> filter.INPUT 
+raw.PREROUTING -> mangle.PREROUTING -> nat.PREROUTING -> mangle.FORWARD -> filter.FORWARD -> mangle.POSTROUTING -> nat.POSTROUTING
+
+这里分析的calico的版本比较老，和最新版中的规则有一些出入，但是原理相同。
+新版本的calico的iptables规则可读性更好，可以直接阅读规则。
+from-XXX: XXX发出的报文            tw: 简写，to wordkoad endpoint
+to-XXX: 发送到XXX的报文            po: 简写，policy outbound
+cali-: 前缀，calico的规则链        pi: 简写，policy inbound
+wl: 简写，workload endpoint        pro: 简写，profile outbound
+fw: 简写，from workload endpoint   pri: 简写，profile inbound
+ 
+(receive pkt)
+cali-PREOUTING@raw -> cali-from-host-endpoint@raw -> cali-PREROUTING@nat
+                   |                                 ^        |
+                   |          (-i cali+)             |        |
+                   +--- (from workload endpoint) ----+        |
+                                                              |
+            (dest  may be container's floating ip)   cali-fip-dnat@nat
+                                                              |
+                                                     (rotuer decision)
+                                                              |
+                     +--------------------------------------------+
+                     |                                            |
+            cali-INPUT@filter                             cali-FORWARD@filter
+         (-i cali+)  |                               (-i cali+)   |    (-o cali+)
+         +----------------------------+              +------------+-------------+
+         |                            |              |            |             |
+ cali-wl-to-host           cali-from-host-endpoint   |  cali-from-host-endpoint |
+     @filter                       @filter           |         @filter          |
+         |                         < END >           |            |             |
+         |                                           |   cali-to-host-endpoint  |
+         |                                           |         @filter          |
+         |                     will return to nat's  |         < END >          |
+         |                       cali-POSTROUTING    |                          |
+ cali-from-wl-dispatch@filter  <---------------------+   cali-to-wl-dispatch@filter
+                      |         \--------------+                       |
+          +-----------------------+            |           +----------------------+
+          |                       |            |           |                      |
+ cali-fw-cali0ef24b1     cali-fw-cali0ef24b2   |  cali tw-cali03f24b1   cali-tw-cali03f24b2
+      @filter                 @filter          |       filter                  @filter
+  (-i cali0ef24b1)          (-i cali0ef24b2)   |   (-o cali0ef24b1)        (-o cali0ef24b2)
+          |                       |            |           |                      |
+          +-----------------------+            |           +----------------------+
+                      |                        |                       |
+           cali-po-[POLICY]@filter             |            cali-pi-[POLICY]@filter
+                      |                        |                       |
+          cali-pro-[PROFILE]@filter            |           cali-pri-[PROFILE]@filter
+                      |                        |                       |
+                   < END >                     +------------> cali-POSTROUTING@nat
+                                               +---------->/           |
+                                               |                cali-fip-snat@nat
+                                               |                       |
+                                               |              cali-nat-outgoing@nat
+                                               |                       |
+                                               |       (if dip is local: send to lookup)
+                                     +---------+--------+   (else: send to nic's qdisc)
+                                     |                  |           < END >    
+                     cali-to-host-endpoint@filter       | 
+                                     |                  | 
+                                     +------------------+ 
+                                               ^ (-o cali+)
+                                               | 
+                                       cali-OUTPUT@filter
+                                               ^    
+(send pkt)                                     | 
+(router descition) -> cali-OUTPUT@nat -> cali-fip-dnat@nat
+node本地发出的报文，经过路由决策之后，直接进入raw,OUTPUT规则链:
+raw.OUTPUT -> mangle.OUTPUT -> nat.OUTPUT -> filter.OUTPUT -> mangle.POSTROUTING -> nat.POSTROUTING
+
+路由决策之前：流入node的报文的处理
+进入raw表
+PREROUTING@raw:
+-A PREROUTING -m comment --comment "cali:6gwbT8clXdHdC1b1" -j cali-PREROUTING
+cali-PREROUTING@RAW:
+
+-A cali-PREROUTING -m comment --comment "cali:x4XbVMc5P_kNXnTy" -j MARK --set-xmark 0x0/0x7000000
+-A cali-PREROUTING -i cali+ -m comment --comment "cali:fQeZek80kVOPa0xO" -j MARK --set-xmark 0x4000000/0x4000000
+-A cali-PREROUTING -m comment --comment "cali:xp3NolkIpulCQL_G" -m mark --mark 0x0/0x4000000 -j cali-from-host-endpoint
+-A cali-PREROUTING -m comment --comment "cali:fbdE50A0BiINbNiA" -m mark --mark 0x1000000/0x1000000 -j ACCEPT
+ 
+
+规则1，清空所有标记
+规则2，从cali+网卡进入的报文，设置mark: 0x4000000/0x4000000
+规则3，非cali+网卡收到的报文，即从host-endpoint进入的报文，进入cali-from-host-endpoints规则链条
+这里没有设置host-endpoint的策略，所有cali-from-host-endpoint规则链是空的。
+
+进入nat表
+PREROUTING@nat:
+-A PREROUTING -m comment --comment "cali:6gwbT8clXdHdC1b1" -j cali-PREROUTING
+-A PREROUTING -m addrtype --dst-type LOCAL -j DOCKER
+
+直接进入cali-PREROUTING
+cali-PREROUTING@nat:
+-A cali-PREROUTING -m comment --comment "cali:r6XmIziWUJsdOK6Z" -j cali-fip-dnat
+
+如果目标地址是fip(floating IP)，会在cali-fip-dnat中做dnat转换
+
+nat表中做目的IP转换，这里没有设置，所以cali-fip-dnat是空的。
+
+经过nat表之后，会进行路由决策:
+
+
+1. 如果是发送给slave1的报文，经过规则链: INPUT@mangle、INPUT@filter
+2. 如果不是发送给slave1报文，经过规则链: FORWARD@mangle、FORWARD@filer、POSTROUTING@mangle、POSTROUTING@nat
+
+路由决策之后：发送到本node的host endpoint 和 workload endpoint
+进入filter表
+INPUT@filter:
+
+
+-A INPUT -m comment --comment "cali:Cz_u1IQiXIMmKD4c" -j cali-INPUT
+ 
+直接进入cali-INPUT
+cali-INPUT@filter:
+-A cali-INPUT -m comment --comment "cali:46gVAqzWLjH8U4O2" -m mark --mark 0x1000000/0x1000000 -m conntrack --ctstate UNTRACKED -j ACCEPT
+-A cali-INPUT -m comment --comment "cali:5M2EkEm-RVlDLAfE" -m conntrack --ctstate INVALID -j DROP
+-A cali-INPUT -m comment --comment "cali:8ggYjLbFRX5Ap9Zj" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A cali-INPUT -i cali+ -m comment --comment "cali:mA3ZJKi9nadUmYVF" -g cali-wl-to-host
+ 
+-A cali-INPUT -m comment --comment "cali:hI4IjifGj0fegLPE" -j MARK --set-xmark 0x0/0x7000000
+-A cali-INPUT -m comment --comment "cali:wdegoKfPlcmsZTOM" -j cali-from-host-endpoint
+-A cali-INPUT -m comment --comment "cali:r875VVc8vFk1f-ZA" -m comment --comment "Host endpoint policy accepted packet." -m mark --mark 0x1000000/0x1000000 -j ACCEPT
+ 
+规则4，从cali+网卡进入的报文，进入wl-to-host的规则链，wl是workload的缩
+规则6，非cali+网卡收到的报文，host-endpoint的规则链
+来自本node上workload endpoint的报文
+检察一下是否允许workload enpoint发出这些报文。
+
+cali-wl-to-host@filter:
+
+-A cali-wl-to-host -p udp -m comment --comment "cali:aEOMPPLgak2S0Lxs" -m multiport --sports 68 -m multiport --dports 67 -j ACCEPT
+-A cali-wl-to-host -p udp -m comment --comment "cali:SzR8ejPiuXtFMS8B" -m multiport --dports 53 -j ACCEPT
+-A cali-wl-to-host -m comment --comment "cali:MEmlbCdco0Fefcrw" -j cali-from-wl-dispatch
+-A cali-wl-to-host -m comment --comment "cali:Q2b2iY2M-vmds5iY" -m comment --comment "Configured DefaultEndpointToHostAction" -j RETURN
+ 
+规则1，允许请求DHCP
+规则2，允许请求DNS
+规则3，匹配workload endpoint各自的规则，将会依次检察policy的egress、各自绑定的profile的egress。
+https://blog.csdn.net/weixin_30621919/article/details/99916421
+根据接收报文的网卡做区分，cali-from-wl-dispatch@filter:
+
+-A cali-from-wl-dispatch -i cali0ef24b1 -m comment --comment "cali:RkM6MKQgU0OTxwKU" -g cali-fw-cali0ef24b1
+-A cali-from-wl-dispatch -i cali0ef24b2 -m comment --comment "cali:7hIahXYNmY9JDfKG" -g cali-fw-cali0ef24b2
+-A cali-from-wl-dispatch -m comment --comment "cali:YKcphdGNZ1PwfGvt" -m comment --comment "Unknown interface" -j DROP
+ 
+规则1，cali0ef24b1是slave1-frontend1
+规则2，cali0ef24b2是slave1-frontend2
+只查看其中一个，cali-fw-cali0ef24b1@filter:
+
+-A cali-fw-cali0ef24b1 -m comment --comment "cali:KOIFJxkWqvpSMSzk" -j MARK --set-xmark 0x0/0x1000000
+-A cali-fw-cali0ef24b1 -m comment --comment "cali:Mm_GAikGLiINmRQh" -m comment --comment "Start of policies" -j MARK --set-xmark 0x0/0x2000000
+-A cali-fw-cali0ef24b1 -m comment --comment "cali:c6bGtQzwKsoipZq6" -m mark --mark 0x0/0x2000000 -j cali-po-namespace-default
+-A cali-fw-cali0ef24b1 -m comment --comment "cali:46b6gNjtXYDXasAi" -m comment --comment "Return if policy accepted" -m mark --mark 0x1000000/0x1000000 -j RETURN
+-A cali-fw-cali0ef24b1 -m comment --comment "cali:6kNf2_vqiCYkwInx" -m comment --comment "Drop if no policies passed packet" -m mark --mark 0x0/0x2000000 -j DROP
+-A cali-fw-cali0ef24b1 -m comment --comment "cali:GWdesho87l08Srht" -m comment --comment "Drop if no profiles matched" -j DROP
+ 
+这个endpoint没有绑定profile，所以只做了policy的egress规则检测
+规则4，cali-po-namespace-default，policy“namespace-default”的egress规则，po表示policy outbound。
+
+
+
