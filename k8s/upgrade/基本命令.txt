@@ -1,0 +1,8 @@
+bash: ps: command not found
+apt-get update && apt-get install procps
+ss:bash:command not found
+yum install iproute -y
+ifconfig:bash:command not found
+yum install net-tools -y
+
+
