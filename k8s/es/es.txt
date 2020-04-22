@@ -1,0 +1,206 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: elasticsearch-logging
+  labels:
+    k8s-app: elasticsearch-logging
+    kubernetes.io/cluster-service: "true"
+    addonmanager.kubernetes.io/mode: Reconcile
+
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: data-elasticsearch-logging-0-##uniqueId##
+  labels:
+    app: elasticsearch-logging-0-##uniqueId##
+  annotations:
+    volume.alpha.kubernetes.io/storage-class: default
+spec:
+  capacity:
+    storage: ##capacity##
+  accessModes:
+  - ReadWriteOnce
+  nfs:
+    server: 10.153.218.188
+    path: /uspnas/2/##uniqueId##
+  persistentVolumeReclaimPolicy: Retain
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data-elasticsearch-logging-0 
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: ##capacity##
+  selector:
+    matchLabels:
+      app: elasticsearch-logging-0-##uniqueId##
+
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: data-elasticsearch-logging-1-##uniqueId##
+  labels:
+    app: elasticsearch-logging-1-##uniqueId##
+  annotations:
+    volume.alpha.kubernetes.io/storage-class: default
+spec:
+  capacity:
+    storage: ##capacity##
+  accessModes:
+  - ReadWriteOnce
+  nfs:
+    server: 10.153.218.188
+    path: /uspnas/2/##uniqueId##
+  persistentVolumeReclaimPolicy: Retain
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data-elasticsearch-logging-1
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+          storage: ##capacity##
+  selector:
+    matchLabels:
+      app: elasticsearch-logging-1-##uniqueId##
+
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: data-elasticsearch-logging-2-##uniqueId##
+  labels:
+    app: elasticsearch-logging-2-##uniqueId##
+  annotations:
+    volume.alpha.kubernetes.io/storage-class: default
+spec:
+  capacity:
+    storage: ##capacity##
+  accessModes:
+  - ReadWriteOnce
+  nfs:
+    server: 10.153.218.188
+    path: /uspnas/2/##uniqueId##
+  persistentVolumeReclaimPolicy: Retain
+  
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data-elasticsearch-logging-2
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: ##capacity##
+  selector:
+    matchLabels:
+      app: elasticsearch-logging-2-##uniqueId##
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: elasticsearch-logging
+  namespace: es1
+  labels:
+    k8s-app: elasticsearch-logging
+    kubernetes.io/cluster-service: "true"
+    addonmanager.kubernetes.io/mode: Reconcile
+    kubernetes.io/name: "Elasticsearch"
+spec:
+  type: NodePort
+  ports:
+  - port: 9200
+    protocol: TCP
+    targetPort: db
+    name: http
+  - port: 9300
+    protocol: TCP
+    targetPort: 9300
+    name: tcp
+  clusterIP: ""
+  selector:
+    k8s-app: elasticsearch-logging
+
+---
+apiVersion: apps/v1beta2
+kind: StatefulSet
+metadata:
+  name: elasticsearch-logging
+  labels:
+    k8s-app: elasticsearch-logging
+    version: v5.6.4
+    kubernetes.io/cluster-service: "true"
+    addonmanager.kubernetes.io/mode: Reconcile
+spec:
+  serviceName: elasticsearch-logging
+  replicas: 3
+  selector:
+    matchLabels:
+      k8s-app: elasticsearch-logging
+      version: v5.6.4
+  template:
+    metadata:
+      labels:
+        k8s-app: elasticsearch-logging
+        version: v5.6.4
+        kubernetes.io/cluster-service: "true"
+    spec:
+      serviceAccountName: elasticsearch-logging
+      containers:
+      - image: 10.153.58.186/system/elasticsearch:v5.6.4
+        name: elasticsearch-logging
+        resources:
+          # need more cpu upon initialization, therefore burstable class
+          limits:
+            cpu: 1000m
+            memory: 1000m
+          requests:
+            cpu: 1m
+            memory: 1m
+        ports:
+        - containerPort: 9200
+          name: db
+          protocol: TCP
+        - containerPort: 9300
+          name: transport
+          protocol: TCP
+        volumeMounts:
+        - name: data
+          mountPath: /data
+        env:
+        - name: "NAMESPACE"
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: ES_JAVA_OPTS
+          value: "-Xms512m -Xmx512m"
+      initContainers:
+      - image: 10.153.58.186/system/alpine:3.6
+        command: ["/sbin/sysctl", "-w", "vm.max_map_count=262144"]
+        name: elasticsearch-logging-init
+        securityContext:
+          privileged: true
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+      annotations:
+        volume.alpha.kubernetes.io/storage-class: anything
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: ##capacity##
